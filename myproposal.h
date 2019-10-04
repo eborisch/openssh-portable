@@ -194,7 +194,13 @@
 
 #endif /* WITH_OPENSSL */
 
-#define	KEX_DEFAULT_COMP	"none,zlib@openssh.com"
+#if HAVE_LIBZSTD
+#define ZSTDS "zstd@openssh.com,"
+#else
+#define ZSTDS ""
+#endif
+
+#define	KEX_DEFAULT_COMP	"none," ZSTDS "zlib@openssh.com"
 #define	KEX_DEFAULT_LANG	""
 
 #define KEX_CLIENT \

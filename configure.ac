@@ -1285,6 +1285,47 @@ AC_CHECK_FUNC([getspnam], ,
 AC_SEARCH_LIBS([basename], [gen], [AC_DEFINE([HAVE_BASENAME], [1],
 	[Define if you have the basename function.])])
 
+# Check whether user wants to use zstd
+ZSTD_MSG="no"
+AC_ARG_WITH(zstd,
+	[  --with-zstd[[=PATH]]      Use zstd for -C compression (optionally in PATH)],
+	[
+    if test "x$withval" != "xyes" -a "x$withval" != "xno"; then
+        if test -d "$withval/lib"; then
+            if test -n "${rpath_opt}"; then
+                LDFLAGS="-L${withval}/lib ${rpath_opt}${withval}/lib ${LDFLAGS}"
+            else
+                LDFLAGS="-L${withval}/lib ${LDFLAGS}"
+            fi
+        else
+            if test -n "${rpath_opt}"; then
+                LDFLAGS="-L${withval} ${rpath_opt}${withval} ${LDFLAGS}"
+            else
+                LDFLAGS="-L${withval} ${LDFLAGS}"
+            fi
+        fi
+        if test -d "$withval/include"; then
+            CPPFLAGS="-I${withval}/include ${CPPFLAGS}"
+        else
+            CPPFLAGS="-I${withval} ${CPPFLAGS}"
+        fi
+    fi
+    if test "x$withval" != "xno"; then
+        ZSTD_MSG="yes"
+		AC_CHECK_HEADER([zstd.h], ,[AC_MSG_ERROR([*** zstd.h missing - please install first or check config.log ***])])
+		AC_CHECK_LIB([zstd], [ZSTD_compressStream2], ,
+			[
+				LIBS="$LIBS -lzstd"
+				AC_TRY_LINK_FUNC([ZSTD_compress], [AC_DEFINE([HAVE_LIBZSTD])],
+					[
+						AC_MSG_ERROR([*** libzstd missing - please install first or check config.log ***])
+					]
+				)
+			]
+		)
+    fi
+])
+
 dnl zlib is required
 AC_ARG_WITH([zlib],
 	[  --with-zlib=PATH        Use zlib in PATH],
@@ -5307,6 +5348,7 @@ echo "                   SELinux support: $SELINUX_MSG"
 echo "              MD5 password support: $MD5_MSG"
 echo "                   libedit support: $LIBEDIT_MSG"
 echo "                   libldns support: $LDNS_MSG"
+echo "                   libzstd support: $ZSTD_MSG"
 echo "  Solaris process contract support: $SPC_MSG"
 echo "           Solaris project support: $SP_MSG"
 echo "         Solaris privilege support: $SPP_MSG"

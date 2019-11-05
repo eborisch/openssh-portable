@@ -703,6 +703,14 @@ ssh_packet_close_internal(struct ssh *ssh, int do_close)
 				deflateEnd(stream);
 #if HAVE_LIBZSTD
 			if (ssh->state->zstd_state) {
+				if (ssh->state->zstd_state->zstdCStream) {
+					ZSTD_freeCCtx(ssh->state->zstd_state->zstdCStream);
+					ssh->state->zstd_state->zstdCStream = NULL;
+				}
+				if (ssh->state->zstd_state->zstdDStream) {
+					ZSTD_freeDCtx(ssh->state->zstd_state->zstdDStream);
+					ssh->state->zstd_state->zstdDStream = NULL;
+				}
 				free(ssh->state->zstd_state);
 				ssh->state->zstd_state = NULL;
 			}
@@ -720,6 +728,14 @@ ssh_packet_close_internal(struct ssh *ssh, int do_close)
 				inflateEnd(stream);
 #if HAVE_LIBZSTD
 			if (ssh->state->zstd_state) {
+				if (ssh->state->zstd_state->zstdCStream) {
+					ZSTD_freeCCtx(ssh->state->zstd_state->zstdCStream);
+					ssh->state->zstd_state->zstdCStream = NULL;
+				}
+				if (ssh->state->zstd_state->zstdDStream) {
+					ZSTD_freeDCtx(ssh->state->zstd_state->zstdDStream);
+					ssh->state->zstd_state->zstdDStream = NULL;
+				}
 				free(ssh->state->zstd_state);
 				ssh->state->zstd_state = NULL;
 			}

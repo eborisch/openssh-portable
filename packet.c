@@ -903,6 +903,7 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 	ZSTD_outBuffer zout;
 	ZSTD_inBuffer zin;
 	u_int64_t elapsed;
+	int mode = ZSTD_e_continue;
 #endif
 
 	if (ssh->state->compression_out_started != 1)
@@ -1004,11 +1005,13 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 					if (zss->clevel == 0) /* 0 is 'use default (3)' */
 						zss->clevel++;
 				}
-			  	ZSTD_CCtx_setParameter(zss->zstdCStream,
-				                       ZSTD_c_compressionLevel,
-									   zss->clevel);
-				/* We store it so a rekey doesn't wipe us out */
-				last_clevel = zss->clevel;
+				if (zss->clevel != last_clevel) {
+					ZSTD_CCtx_setParameter(zss->zstdCStream,
+										   ZSTD_c_compressionLevel,
+										   zss->clevel);
+					/* We store it so a rekey doesn't wipe us out */
+					last_clevel = zss->clevel;
+				}
 				debug2("%lu:%d:%f:%d", 
 				       ssh->state->compression_out_stream.total_in,
 					   zss->exp, zss->pct_avg, zss->clevel);
@@ -1030,8 +1033,13 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 		} 
 		do {
 			zout.pos = 0;
+			if (zin.pos == zin.size || zin.size < zout.size)
+				mode = ZSTD_e_flush;
+			debug3("Ci:%ld:%ld", zin.pos, zin.size);
 			remain = ZSTD_compressStream2(zss->zstdCStream, &zout, &zin,
-			                              ZSTD_e_end);
+			                              mode);
+			debug3("Co:%ld", zout.pos);
+			debug3("C:%ld", remain);
 			if (ZSTD_isError(remain)) {
 				ssh->state->compression_out_failures++;
 				return SSH_ERR_INVALID_FORMAT;
@@ -1039,7 +1047,7 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 			if ((r = sshbuf_put(out, zout.dst, zout.pos)) != 0)
 				return r;
 			ssh->state->compression_out_stream.total_out += zout.pos;
-		} while (remain || zin.pos < zin.size);
+		} while (remain || zin.pos < zin.size || mode == ZSTD_e_continue);
 		break;
 	}
 #endif
@@ -1122,15 +1130,19 @@ uncompress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 		}
 		for (;;) {
 			zout.pos = 0;
+			debug3("Di:%ld:%ld", zin.pos, zin.size);
 			remain = ZSTD_decompressStream(zss->zstdDStream, &zout, &zin);
+			debug3("Do:%ld", zout.pos);
+			debug3("D:%ld", remain);
 			if (ZSTD_isError(remain)) {
+				debug("DE:%s", ZSTD_getErrorName(remain));
 				ssh->state->compression_in_failures++;
 				return SSH_ERR_INTERNAL_ERROR;
 			}
 			if ((r = sshbuf_put(out, zout.dst, zout.pos)) != 0)
 				return r;
 			ssh->state->compression_in_stream.total_out += zout.pos;
-			if (remain == 0 && zout.pos < zout.size && zin.pos == zin.size)
+			if (zout.pos < zout.size && zin.pos == zin.size)
 				return 0;
 		};
 		break;

@@ -107,7 +107,7 @@
 #define ZSTD_CPU_MAX 0.99f
 #define ZSTD_CPU_MIN 0.85f
 
-static int last_clevel = ZSTD_CLEVEL_DEFAULT;
+static int last_clevel = -20; /* ZSTD_CLEVEL_DEFAULT; */
 
 struct Usage {
 	u_int64_t tstamp;
@@ -115,7 +115,7 @@ struct Usage {
 };
 
 void
-setUsage(struct Usage * stamp, long * vcsw)
+setUsage(struct Usage * stamp, long * vcsw, long * ivcsw)
 {
 	struct rusage r_usage;
 	struct timespec ts;
@@ -135,13 +135,15 @@ setUsage(struct Usage * stamp, long * vcsw)
 		debug("csw:%ld:%ld", r_usage.ru_nvcsw - vc, r_usage.ru_nivcsw - ivc);
 		if (vcsw)
 			*vcsw = r_usage.ru_nvcsw - vc;
+		if (ivcsw)
+			*ivcsw = r_usage.ru_nivcsw - ivc;
 		vc = r_usage.ru_nvcsw;
 		ivc = r_usage.ru_nivcsw;
 	}
 }
 
 float
-getProcPct(struct Usage * stamp, u_int64_t * elapsed, long * vcsw)
+getProcPct(struct Usage * stamp, u_int64_t * elapsed, long * vcsw, long * ivcsw)
 {
 	struct Usage now;
 	float pct;
@@ -149,7 +151,7 @@ getProcPct(struct Usage * stamp, u_int64_t * elapsed, long * vcsw)
 	if (stamp->tstamp == 0 || stamp->cpu == 0)
 		return (ZSTD_CPU_MAX + ZSTD_CPU_MIN) / 2.0f;
 
-	setUsage(&now, vcsw);
+	setUsage(&now, vcsw, ivcsw);
 	if (elapsed)
 		*elapsed = now.tstamp - stamp->tstamp;
 	pct = 1.0f * (now.cpu - stamp->cpu) / (now.tstamp - stamp->tstamp);
@@ -904,7 +906,7 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 	ZSTD_outBuffer zout;
 	ZSTD_inBuffer zin;
 	u_int64_t elapsed;
-	long vcsw;
+	long vcsw, ivcsw;
 #endif
 
 	if (ssh->state->compression_out_started != 1)
@@ -956,12 +958,12 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 		 * delay between updates, such that we don't have to do time-related
 		 * calls and can just count bytes. */
 		if (zss->usage.tstamp == 0) {
-			setUsage(&zss->usage, &vcsw);
+			setUsage(&zss->usage, &vcsw, &ivcsw);
 		} else if (ssh->state->compression_out_stream.total_out >> zss->exp !=
 		           zss->lastUpd) {
 			/* Dynamically adjust compression level ~ 1/s to try to achive
 			 * CPU utilization between ZSTD_CPU_MIN and ZSTD_CPU_MAX */
-			pct = getProcPct(&zss->usage, &elapsed, &vcsw);
+			pct = getProcPct(&zss->usage, &elapsed, &vcsw, &ivcsw);
 			/* Slight history to CPU% tracking... not sure if worth it */
 			if (pct > zss->pct_avg) {
 				/* React quickly to high CPU */
@@ -972,13 +974,13 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 			}
 			/* Try to find the right number of bytes to update ~ 1/s */
 			if (elapsed) {
-				while (elapsed > (1 << 20) && zss->exp > 1)
+				while (elapsed > (1 << 21) && zss->exp > 1)
 				{
 					/* We waited too long */
 					elapsed >>= 2;
 					zss->exp--;
 				}
-				while (elapsed < (1 << 18) && zss->exp < 30)
+				while (elapsed < (1 << 19) && zss->exp < 30)
 				{
 					/* We didn't wait long enough */
 					elapsed <<= 1;
@@ -989,7 +991,7 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 			zss->lastUpd = 
 				ssh->state->compression_out_stream.total_out >> zss->exp;
 
-#if 0
+#if 1
 			/* Only update if we are outside the _MIN .. _MAX window. */
 			if (zss->pct_avg > ZSTD_CPU_MAX || zss->pct_avg < ZSTD_CPU_MIN) {
 				if (zss->pct_avg > ZSTD_CPU_MAX) {
@@ -1023,19 +1025,18 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 				debug("%lu:-", ssh->state->compression_out_stream.total_in);
 			}
 #else
-			if (vcsw == 0) {
-				/* If we never yielded/blocked, we're using too much of the
+#ifdef __FreeBSD__
+#define BUMP_DOWN (ivcsw)
+#define BUMP_UP (vcsw > ivcsw || !vcsw)
+#endif
+			if (BUMP_DOWN) {
+				/* If rarely yielded/blocked, we're using too much of the
 				 * available CPU. Back off on compression. */
 				if (zss->clevel > ZSTD_minCLevel())
 					zss->clevel--;
 				if (zss->clevel == 0) /* 0 is 'use default (3)'*/
 					zss->clevel--;
-			} else if (vcsw < 3) {
-				/* Perfect. We yielded just a bit. */
-			} else if (ssh->state->interactive_mode && vcsw < 20) {
-				/* don't add latency to sparadic locks of data. */
-				zss->clevel = ZSTD_CLEVEL_DEFAULT;
-			} else {
+			} else if (BUMP_UP) {
 				/* We're yielding more than a handful of times. Use more CPU
 				 * for higher compression level. */
 				if (zss->clevel < 22) /* Much higher memory 20+ */
@@ -1043,6 +1044,10 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 				if (zss->clevel == 0) /* 0 is 'use default (3)' */
 					zss->clevel++;
 			}
+			if (ssh->state->interactive_mode && vcsw < 20) {
+				/* don't add latency to sparadic blocks of data. */
+				zss->clevel = ZSTD_CLEVEL_DEFAULT;
+			}	
 			if (zss->clevel != last_clevel) {
 				ZSTD_CCtx_setParameter(zss->zstdCStream,
 									   ZSTD_c_compressionLevel,

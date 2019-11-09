@@ -104,8 +104,8 @@
 
 #if HAVE_LIBZSTD
 #include <zstd.h>
-#define ZSTD_CPU_MAX 0.99
-#define ZSTD_CPU_MIN 0.85
+#define ZSTD_CPU_MAX 0.99f
+#define ZSTD_CPU_MIN 0.85f
 
 static int last_clevel = ZSTD_CLEVEL_DEFAULT;
 
@@ -115,40 +115,41 @@ struct Usage {
 };
 
 void
-setUsage(struct Usage * stamp)
+setUsage(struct Usage * stamp, long * vcsw)
 {
 	struct rusage r_usage;
 	struct timespec ts;
-
-	if (-1 == clock_gettime(CLOCK_MONOTONIC, &ts)){
-		debug("Error getting clock time!");
-		stamp->tstamp = 0;
-	} else {
-		stamp->tstamp = ts.tv_sec * 1000000 +
-		                ts.tv_nsec / 1000;
-	}
+	static long vc, ivc;
+	
+	monotime_ts(&ts);
+	stamp->tstamp = ts.tv_sec * 1000000 +
+					ts.tv_nsec / 1000;
 	
 	if (-1 == getrusage(RUSAGE_SELF, &r_usage)){
 		debug("Error getting resource usage!");
 		stamp->cpu = 0;
 	} else {
-		stamp->cpu = r_usage.ru_utime.tv_sec * 1000000 + 
-		             r_usage.ru_utime.tv_usec +
-					 r_usage.ru_stime.tv_sec * 1000000 + 
-		             r_usage.ru_stime.tv_usec ;  
+		stamp->cpu = \
+		  (r_usage.ru_utime.tv_sec + r_usage.ru_stime.tv_sec) * 1000000 + 
+		  r_usage.ru_utime.tv_usec + r_usage.ru_stime.tv_usec;  
+		debug("csw:%ld:%ld", r_usage.ru_nvcsw - vc, r_usage.ru_nivcsw - ivc);
+		if (vcsw)
+			*vcsw = r_usage.ru_nvcsw - vc;
+		vc = r_usage.ru_nvcsw;
+		ivc = r_usage.ru_nivcsw;
 	}
 }
 
 float
-getProcPct(struct Usage * stamp, u_int64_t * elapsed)
+getProcPct(struct Usage * stamp, u_int64_t * elapsed, long * vcsw)
 {
 	struct Usage now;
 	float pct;
-	/* If we don't have timing, always say we are at 0.90 */
-	if (stamp->tstamp == 0)
-		return 0.90f;
+	/* If we don't have timing, always say we are at between _MIN and _MAX*/
+	if (stamp->tstamp == 0 || stamp->cpu == 0)
+		return (ZSTD_CPU_MAX + ZSTD_CPU_MIN) / 2.0f;
 
-	setUsage(&now);
+	setUsage(&now, vcsw);
 	if (elapsed)
 		*elapsed = now.tstamp - stamp->tstamp;
 	pct = 1.0f * (now.cpu - stamp->cpu) / (now.tstamp - stamp->tstamp);
@@ -903,6 +904,7 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 	ZSTD_outBuffer zout;
 	ZSTD_inBuffer zin;
 	u_int64_t elapsed;
+	long vcsw;
 #endif
 
 	if (ssh->state->compression_out_started != 1)
@@ -954,19 +956,19 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 		 * delay between updates, such that we don't have to do time-related
 		 * calls and can just count bytes. */
 		if (zss->usage.tstamp == 0) {
-			setUsage(&zss->usage);
+			setUsage(&zss->usage, &vcsw);
 		} else if (ssh->state->compression_out_stream.total_out >> zss->exp !=
 		           zss->lastUpd) {
 			/* Dynamically adjust compression level ~ 1/s to try to achive
 			 * CPU utilization between ZSTD_CPU_MIN and ZSTD_CPU_MAX */
-			pct = getProcPct(&zss->usage, &elapsed);
+			pct = getProcPct(&zss->usage, &elapsed, &vcsw);
 			/* Slight history to CPU% tracking... not sure if worth it */
 			if (pct > zss->pct_avg) {
 				/* React quickly to high CPU */
-				zss->pct_avg = (2.0f * pct + zss->pct_avg) / 3.0f;
+				zss->pct_avg = (1.0f * pct + zss->pct_avg) / 2.0f;
 			} else {
 				/* Decay slowly */
-				zss->pct_avg = (2.0f * zss->pct_avg + pct) / 3.0f;
+				zss->pct_avg = (3.0f * zss->pct_avg + pct) / 4.0f;
 			}
 			/* Try to find the right number of bytes to update ~ 1/s */
 			if (elapsed) {
@@ -987,6 +989,7 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 			zss->lastUpd = 
 				ssh->state->compression_out_stream.total_out >> zss->exp;
 
+#if 0
 			/* Only update if we are outside the _MIN .. _MAX window. */
 			if (zss->pct_avg > ZSTD_CPU_MAX || zss->pct_avg < ZSTD_CPU_MIN) {
 				if (zss->pct_avg > ZSTD_CPU_MAX) {
@@ -999,7 +1002,7 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 					 * period. Set the compression back to default. */
 					 zss->clevel = ZSTD_CLEVEL_DEFAULT;
 				} else {
-					if (zss->clevel < 19) /* Much higher memory 20+ */
+					if (zss->clevel < 22) /* Much higher memory 20+ */
 						zss->clevel++;
 					if (zss->clevel == 0) /* 0 is 'use default (3)' */
 						zss->clevel++;
@@ -1010,13 +1013,51 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 					                       zss->clevel);
 					/* We store it so a rekey doesn't wipe us out */
 					last_clevel = zss->clevel;
+					debug("%lu:%d:%f:%d", 
+						   ssh->state->compression_out_stream.total_in,
+						   zss->exp, zss->pct_avg, zss->clevel);
+				} else {
+					debug("%lu:-", ssh->state->compression_out_stream.total_in);
 				}
-				debug2("%lu:%d:%f:%d", 
-				       ssh->state->compression_out_stream.total_in,
+			} else {
+				debug("%lu:-", ssh->state->compression_out_stream.total_in);
+			}
+#else
+			if (vcsw == 0) {
+				/* If we never yielded/blocked, we're using too much of the
+				 * available CPU. Back off on compression. */
+				if (zss->clevel > ZSTD_minCLevel())
+					zss->clevel--;
+				if (zss->clevel == 0) /* 0 is 'use default (3)'*/
+					zss->clevel--;
+			} else if (vcsw < 3) {
+				/* Perfect. We yielded just a bit. */
+			} else if (ssh->state->interactive_mode && vcsw < 20) {
+				/* don't add latency to sparadic locks of data. */
+				zss->clevel = ZSTD_CLEVEL_DEFAULT;
+			} else {
+				/* We're yielding more than a handful of times. Use more CPU
+				 * for higher compression level. */
+				if (zss->clevel < 22) /* Much higher memory 20+ */
+					zss->clevel++;
+				if (zss->clevel == 0) /* 0 is 'use default (3)' */
+					zss->clevel++;
+			}
+			if (zss->clevel != last_clevel) {
+				ZSTD_CCtx_setParameter(zss->zstdCStream,
+									   ZSTD_c_compressionLevel,
+									   zss->clevel);
+				/* We store it so a rekey doesn't wipe us out */
+				last_clevel = zss->clevel;
+				debug("%lu:%d:%f:%d", 
+					   ssh->state->compression_out_stream.total_in,
 					   zss->exp, zss->pct_avg, zss->clevel);
 			} else {
-				debug2("%lu:-", ssh->state->compression_out_stream.total_in);
+				debug("%lu:::%d",
+					  ssh->state->compression_out_stream.total_in,
+					  zss->clevel);
 			}
+#endif
 		}
 		zin.src = ssh->state->compression_out_stream.next_in;
 		zin.size = ssh->state->compression_out_stream.avail_in;

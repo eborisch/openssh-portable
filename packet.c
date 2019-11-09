@@ -974,13 +974,13 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 			}
 			/* Try to find the right number of bytes to update ~ 1/s */
 			if (elapsed) {
-				while (elapsed > (1 << 21) && zss->exp > 1)
+				while (elapsed > (1 << 19) && zss->exp > 1)
 				{
 					/* We waited too long */
 					elapsed >>= 2;
 					zss->exp--;
 				}
-				while (elapsed < (1 << 19) && zss->exp < 30)
+				while (elapsed < (1 << 17) && zss->exp < 30)
 				{
 					/* We didn't wait long enough */
 					elapsed <<= 1;
@@ -991,7 +991,7 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 			zss->lastUpd = 
 				ssh->state->compression_out_stream.total_out >> zss->exp;
 
-#if 1
+#if 0
 			/* Only update if we are outside the _MIN .. _MAX window. */
 			if (zss->pct_avg > ZSTD_CPU_MAX || zss->pct_avg < ZSTD_CPU_MIN) {
 				if (zss->pct_avg > ZSTD_CPU_MAX) {
@@ -1028,6 +1028,9 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 #ifdef __FreeBSD__
 #define BUMP_DOWN (ivcsw)
 #define BUMP_UP (vcsw > ivcsw || !vcsw)
+#elif defined(__APPLE__)
+#define BUMP_DOWN (vcsw ==0)
+#define BUMP_UP (vcsw > 5)
 #endif
 			if (BUMP_DOWN) {
 				/* If rarely yielded/blocked, we're using too much of the

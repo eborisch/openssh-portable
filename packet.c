@@ -103,23 +103,24 @@
 #endif
 
 #if HAVE_LIBZSTD
+#define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
-#define ZSTD_CPU_MAX 0.99f
+#define ZSTD_CPU_MAX 0.95f
 #define ZSTD_CPU_MIN 0.85f
 
-static int last_clevel = -20; /* ZSTD_CLEVEL_DEFAULT; */
+static int last_clevel = -5; /* ZSTD_CLEVEL_DEFAULT; */
 
 struct Usage {
 	u_int64_t tstamp;
-	u_int64_t cpu;
+	u_int64_t cpu_usr;
+	u_int64_t cpu_sys;
 };
 
 void
-setUsage(struct Usage * stamp, long * vcsw, long * ivcsw)
+setUsage(struct Usage * stamp)
 {
 	struct rusage r_usage;
 	struct timespec ts;
-	static long vc, ivc;
 	
 	monotime_ts(&ts);
 	stamp->tstamp = ts.tv_sec * 1000000 +
@@ -127,34 +128,35 @@ setUsage(struct Usage * stamp, long * vcsw, long * ivcsw)
 	
 	if (-1 == getrusage(RUSAGE_SELF, &r_usage)){
 		debug("Error getting resource usage!");
-		stamp->cpu = 0;
+		stamp->cpu_usr = 0;
+		stamp->cpu_sys = 0;
 	} else {
-		stamp->cpu = \
-		  (r_usage.ru_utime.tv_sec + r_usage.ru_stime.tv_sec) * 1000000 + 
-		  r_usage.ru_utime.tv_usec + r_usage.ru_stime.tv_usec;  
-		debug("csw:%ld:%ld", r_usage.ru_nvcsw - vc, r_usage.ru_nivcsw - ivc);
-		if (vcsw)
-			*vcsw = r_usage.ru_nvcsw - vc;
-		if (ivcsw)
-			*ivcsw = r_usage.ru_nivcsw - ivc;
-		vc = r_usage.ru_nvcsw;
-		ivc = r_usage.ru_nivcsw;
+		stamp->cpu_usr = r_usage.ru_utime.tv_sec * 1000000
+		                 + r_usage.ru_utime.tv_usec;  
+		stamp->cpu_sys = r_usage.ru_stime.tv_sec * 1000000
+		                 + r_usage.ru_stime.tv_usec;  
 	}
 }
 
 float
-getProcPct(struct Usage * stamp, u_int64_t * elapsed, long * vcsw, long * ivcsw)
+getProcPct(struct Usage * stamp, u_int64_t * elapsed)
 {
 	struct Usage now;
 	float pct;
+	float sys_pct;
 	/* If we don't have timing, always say we are at between _MIN and _MAX*/
-	if (stamp->tstamp == 0 || stamp->cpu == 0)
+	if (stamp->tstamp == 0 || stamp->cpu_usr == 0)
 		return (ZSTD_CPU_MAX + ZSTD_CPU_MIN) / 2.0f;
 
-	setUsage(&now, vcsw, ivcsw);
+	setUsage(&now);
 	if (elapsed)
 		*elapsed = now.tstamp - stamp->tstamp;
-	pct = 1.0f * (now.cpu - stamp->cpu) / (now.tstamp - stamp->tstamp);
+	pct = 1.0f * (now.cpu_usr - stamp->cpu_usr) /
+		   (now.tstamp - stamp->tstamp);
+	sys_pct = 1.0f * (now.cpu_sys - stamp->cpu_sys) /
+		   (now.tstamp - stamp->tstamp);
+	debug("u%%:s%%: %0.2f:%0.2f:%02f", pct, sys_pct, pct / (1.0f - sys_pct));
+	pct /= (1.0f - sys_pct);
 	*stamp = now;
 
 	return pct;
@@ -185,6 +187,11 @@ struct ZSTD_state {
 	float pct_avg;
 	int clevel;
 	unsigned exp;
+	size_t h_pos;
+	char hbuf[PACKET_MAX_SIZE];
+	char cbuf[ZSTD_COMPRESSBOUND(PACKET_MAX_SIZE)];
+	size_t d_pos;
+	char dbuf[2 * PACKET_MAX_SIZE];
 };
 #endif
 
@@ -824,7 +831,8 @@ start_compression_out(struct ssh *ssh, int level)
 		if (ssh->state->zstd_state == NULL)
 			return SSH_ERR_ALLOC_FAIL;
 		struct ZSTD_state * zss = ssh->state->zstd_state;
-		zss->exp = 12; /* 4KB initial update size */
+		zss->exp = 10; /* 1KB initial update size */
+		zss->pct_avg = 1.0; /* Start assuming we're maxing out the CPU */
 		zss->clevel = last_clevel; /* persist between rekeys */
 		if (zss->zstdCStream == NULL)
 			zss->zstdCStream = ZSTD_createCStream();
@@ -840,6 +848,7 @@ start_compression_out(struct ssh *ssh, int level)
 		ZSTD_CCtx_reset(zss->zstdCStream, ZSTD_reset_session_and_parameters);
 		ZSTD_CCtx_setParameter(zss->zstdCStream,
 		                       ZSTD_c_compressionLevel, zss->clevel);
+		ZSTD_compressBegin(zss->zstdCStream, zss->clevel);
 		return 0;
 #endif
 	}
@@ -885,6 +894,7 @@ start_compression_in(struct ssh *ssh)
 		}
 		ssh->state->compression_in_started = 1;
 		ZSTD_DCtx_reset(zss->zstdDStream, ZSTD_reset_session_and_parameters);
+		ZSTD_decompressBegin(zss->zstdDStream);
 		return 0;
 #endif
 	}
@@ -903,10 +913,8 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 	u_int comptype;
 	struct ZSTD_state *zss;
 	size_t remain;
-	ZSTD_outBuffer zout;
-	ZSTD_inBuffer zin;
 	u_int64_t elapsed;
-	long vcsw, ivcsw;
+	size_t cin;
 #endif
 
 	if (ssh->state->compression_out_started != 1)
@@ -958,20 +966,21 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 		 * delay between updates, such that we don't have to do time-related
 		 * calls and can just count bytes. */
 		if (zss->usage.tstamp == 0) {
-			setUsage(&zss->usage, &vcsw, &ivcsw);
+			setUsage(&zss->usage);
 		} else if (ssh->state->compression_out_stream.total_out >> zss->exp !=
 		           zss->lastUpd) {
 			/* Dynamically adjust compression level ~ 1/s to try to achive
 			 * CPU utilization between ZSTD_CPU_MIN and ZSTD_CPU_MAX */
-			pct = getProcPct(&zss->usage, &elapsed, &vcsw, &ivcsw);
+			pct = getProcPct(&zss->usage, &elapsed);
 			/* Slight history to CPU% tracking... not sure if worth it */
 			if (pct > zss->pct_avg) {
 				/* React quickly to high CPU */
 				zss->pct_avg = (1.0f * pct + zss->pct_avg) / 2.0f;
 			} else {
-				/* Decay slowly */
-				zss->pct_avg = (3.0f * zss->pct_avg + pct) / 4.0f;
+				/* Slowly adjust to continually low CPU. */
+				zss->pct_avg = (2.0f * zss->pct_avg + pct) / 3.0f;
 			}
+			zss->pct_avg = pct;
 			/* Try to find the right number of bytes to update ~ 1/s */
 			if (elapsed) {
 				while (elapsed > (1 << 19) && zss->exp > 1)
@@ -983,78 +992,48 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 				while (elapsed < (1 << 17) && zss->exp < 30)
 				{
 					/* We didn't wait long enough */
-					elapsed <<= 1;
+					elapsed <<= 2;
 					zss->exp++;
 				}
 			}
-			/* Store current time (shifted by our detected exponent */
-			zss->lastUpd = 
-				ssh->state->compression_out_stream.total_out >> zss->exp;
-
-#if 0
 			/* Only update if we are outside the _MIN .. _MAX window. */
 			if (zss->pct_avg > ZSTD_CPU_MAX || zss->pct_avg < ZSTD_CPU_MIN) {
 				if (zss->pct_avg > ZSTD_CPU_MAX) {
-					if (zss->clevel > ZSTD_minCLevel())
-						zss->clevel--;
+					zss->clevel--;
 					if (zss->clevel == 0) /* 0 is 'use default (3)'*/
 						zss->clevel--;
+					if (zss->clevel < ZSTD_minCLevel())
+					    zss->clevel = ZSTD_minCLevel();
 				} else if (zss->pct_avg < 0.02) {
 					/* For very low utilization, we're likely in an interactive
 					 * period. Set the compression back to default. */
 					 zss->clevel = ZSTD_CLEVEL_DEFAULT;
 				} else {
-					if (zss->clevel < 22) /* Much higher memory 20+ */
+					if (zss->clevel < ZSTD_maxCLevel())
 						zss->clevel++;
 					if (zss->clevel == 0) /* 0 is 'use default (3)' */
 						zss->clevel++;
 				}
-				if (zss->clevel != last_clevel) {
-					ZSTD_CCtx_setParameter(zss->zstdCStream,
-					                       ZSTD_c_compressionLevel,
-					                       zss->clevel);
-					/* We store it so a rekey doesn't wipe us out */
-					last_clevel = zss->clevel;
-					debug("%lu:%d:%f:%d", 
-						   ssh->state->compression_out_stream.total_in,
-						   zss->exp, zss->pct_avg, zss->clevel);
-				} else {
-					debug("%lu:-", ssh->state->compression_out_stream.total_in);
-				}
-			} else {
-				debug("%lu:-", ssh->state->compression_out_stream.total_in);
 			}
-#else
-#ifdef __FreeBSD__
-#define BUMP_DOWN (ivcsw)
-#define BUMP_UP (vcsw > ivcsw || !vcsw)
-#elif defined(__APPLE__)
-#define BUMP_DOWN (vcsw ==0)
-#define BUMP_UP (vcsw > 5)
-#endif
-			if (BUMP_DOWN) {
-				/* If rarely yielded/blocked, we're using too much of the
-				 * available CPU. Back off on compression. */
-				if (zss->clevel > ZSTD_minCLevel())
-					zss->clevel--;
-				if (zss->clevel == 0) /* 0 is 'use default (3)'*/
-					zss->clevel--;
-			} else if (BUMP_UP) {
-				/* We're yielding more than a handful of times. Use more CPU
-				 * for higher compression level. */
-				if (zss->clevel < 22) /* Much higher memory 20+ */
-					zss->clevel++;
-				if (zss->clevel == 0) /* 0 is 'use default (3)' */
-					zss->clevel++;
-			}
-			if (ssh->state->interactive_mode && vcsw < 20) {
-				/* don't add latency to sparadic blocks of data. */
+			if (ssh->state->interactive_mode) {
 				zss->clevel = ZSTD_CLEVEL_DEFAULT;
 			}	
 			if (zss->clevel != last_clevel) {
-				ZSTD_CCtx_setParameter(zss->zstdCStream,
-									   ZSTD_c_compressionLevel,
-									   zss->clevel);
+				remain = \
+				  ZSTD_compressEnd(zss->zstdCStream,
+				                   zss->cbuf,
+				                   sizeof(zss->cbuf),
+				                   NULL,
+				                   0);
+				if (ZSTD_isError(remain)) {
+					debug("CE:%s", ZSTD_getErrorName(remain));
+					ssh->state->compression_out_failures++;
+					return SSH_ERR_INVALID_FORMAT;
+				}
+				ssh->state->compression_out_stream.total_out += remain;
+				if ((r = sshbuf_put(out, zss->cbuf, remain)) != 0)
+					return r;
+				ZSTD_compressBegin(zss->zstdCStream, zss->clevel);
 				/* We store it so a rekey doesn't wipe us out */
 				last_clevel = zss->clevel;
 				debug("%lu:%d:%f:%d", 
@@ -1065,35 +1044,33 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 					  ssh->state->compression_out_stream.total_in,
 					  zss->clevel);
 			}
-#endif
+			/* Store current time (shifted by our detected exponent */
+			zss->lastUpd = 
+				ssh->state->compression_out_stream.total_out >> zss->exp;
 		}
-		zin.src = ssh->state->compression_out_stream.next_in;
-		zin.size = ssh->state->compression_out_stream.avail_in;
-		zin.pos = 0;
-		zout.dst = buf;
-		zout.size = sizeof(buf);
-		ssh->state->compression_out_stream.total_in += zin.size;
-		if (zin.size <= 9) { /* Tiny packet bypass */
-			if ((r = sshbuf_put(out, zin.src, zin.size)) != 0)
-				return r;
-			ssh->state->compression_out_stream.total_out += zin.size;
-			break;
-		} 
-		do {
-			zout.pos = 0;
-			debug3("Ci:%ld:%ld", zin.pos, zin.size);
-			remain = ZSTD_compressStream2(zss->zstdCStream, &zout, &zin,
-			                              ZSTD_e_end);
-			debug3("Co:%ld", zout.pos);
-			debug3("C:%ld", remain);
-			if (ZSTD_isError(remain)) {
-				ssh->state->compression_out_failures++;
-				return SSH_ERR_INVALID_FORMAT;
-			}
-			if ((r = sshbuf_put(out, zout.dst, zout.pos)) != 0)
-				return r;
-			ssh->state->compression_out_stream.total_out += zout.pos;
-		} while (remain || zin.pos < zin.size);
+		cin = ssh->state->compression_out_stream.avail_in;
+		if (zss->h_pos + cin > sizeof(zss->hbuf))
+			zss->h_pos = 0;
+		memcpy(zss->hbuf + zss->h_pos, 
+		       ssh->state->compression_out_stream.next_in,
+               cin);
+		debug3("C:%ld:%ld",cin, sizeof(zss->cbuf));
+		remain = \
+		  ZSTD_compressContinue(zss->zstdCStream,
+		                        zss->cbuf,
+								sizeof(zss->cbuf),
+		                        zss->hbuf + zss->h_pos,
+								cin);
+		zss->h_pos += cin;
+		ssh->state->compression_out_stream.total_in += cin;
+		if (ZSTD_isError(remain)) {
+			debug("CE:%s", ZSTD_getErrorName(remain));
+			ssh->state->compression_out_failures++;
+			return SSH_ERR_INVALID_FORMAT;
+		}
+		ssh->state->compression_out_stream.total_out += remain;
+		if ((r = sshbuf_put(out, zss->cbuf, remain)) != 0)
+			return r;
 		break;
 	}
 #endif
@@ -1108,9 +1085,7 @@ uncompress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 #if HAVE_LIBZSTD
 	u_int comptype;
 	struct ZSTD_state *zss;
-	size_t remain;
-	ZSTD_outBuffer zout;
-	ZSTD_inBuffer zin;
+	size_t remain, nss;
 #endif
 
 	if (ssh->state->compression_in_started != 1)
@@ -1160,35 +1135,37 @@ uncompress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 	break;
 	case COMP_ZSTD_DELAYED:
 		zss = ssh->state->zstd_state;
-		zin.src = ssh->state->compression_in_stream.next_in;
-		zin.size = ssh->state->compression_in_stream.avail_in;
-		zin.pos = 0;
-		ssh->state->compression_in_stream.total_in += zin.size;
-		zout.dst = buf;
-		zout.size = sizeof(buf);
-		if (zin.size <= 9) {
-			/* Tiny packet bypass; An empty & finished zstd frame is 9 bytes
-			 * and we never have empty frames. */
-			if ((r = sshbuf_put(out, zin.src, zin.size)) != 0)
-				return r;
-			ssh->state->compression_in_stream.total_out += zin.size;
-			break;
-		}
 		for (;;) {
-			zout.pos = 0;
-			debug3("Di:%ld:%ld", zin.pos, zin.size);
-			remain = ZSTD_decompressStream(zss->zstdDStream, &zout, &zin);
-			debug3("Do:%ld", zout.pos);
-			debug3("D:%ld", remain);
+			nss= ZSTD_nextSrcSizeToDecompress(zss->zstdDStream);
+			/* assert(remain >= ssh->state->compression_in_stream.avail_in); */
+			if (zss->d_pos + PACKET_MAX_SIZE > sizeof(zss->dbuf))
+				zss->d_pos = 0;
+			if (nss == 0) { /* end of frame, changed compression level */
+				ZSTD_DCtx_reset(zss->zstdDStream,
+				                ZSTD_reset_session_and_parameters);
+				ZSTD_decompressBegin(zss->zstdDStream);
+				continue;
+			}
+			ssh->state->compression_in_stream.total_in += nss;
+			remain = ZSTD_decompressContinue(zss->zstdDStream,
+			  zss->dbuf + zss->d_pos,
+			  sizeof(zss->dbuf) - zss->d_pos,
+			  ssh->state->compression_in_stream.next_in,
+			  nss);
 			if (ZSTD_isError(remain)) {
 				debug("DE:%s", ZSTD_getErrorName(remain));
 				ssh->state->compression_in_failures++;
 				return SSH_ERR_INTERNAL_ERROR;
 			}
-			if ((r = sshbuf_put(out, zout.dst, zout.pos)) != 0)
-				return r;
-			ssh->state->compression_in_stream.total_out += zout.pos;
-			if (remain == 0 && zout.pos < zout.size && zin.pos == zin.size)
+			ssh->state->compression_in_stream.next_in += nss;
+			ssh->state->compression_in_stream.avail_in -= nss;
+			if (remain) {
+				if ((r = sshbuf_put(out, zss->dbuf + zss->d_pos, remain)) != 0)
+					return r;
+				zss->d_pos += remain;
+				ssh->state->compression_in_stream.total_out += remain;
+			}
+			if (ssh->state->compression_in_stream.avail_in == 0)
 				return 0;
 		};
 		break;

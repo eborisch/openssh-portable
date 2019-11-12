@@ -990,10 +990,9 @@ compress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 					elapsed >>= 1;
 					zss->exp--;
 				}
-				while (elapsed < (1 << 28) && zss->exp < 40)
+				if (elapsed < (1 << 28) && zss->exp < 40)
 				{
 					/* We didn't wait long enough */
-					elapsed <<= 2;
 					zss->exp++;
 				}
 			}

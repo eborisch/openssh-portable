@@ -802,7 +802,7 @@ choose_comp(struct sshcomp *comp, char *client, char *server)
 		comp->type = COMP_DELAYED;
 #ifdef COMP_ZSTD_DELAYED
 #warning EXPERIMENTAL ZSTD SUPPORT
-	} else if (strcmp(name, "zstd@openssh.com") == 0) {
+	} else if (strcmp(name, "zstd@testing.null") == 0) {
 		comp->type = COMP_ZSTD_DELAYED;
 #endif
 	} else if (strcmp(name, "zlib") == 0) {

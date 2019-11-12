@@ -195,7 +195,7 @@
 #endif /* WITH_OPENSSL */
 
 #if HAVE_LIBZSTD
-#define ZSTDS "zstd@openssh.com,"
+#define ZSTDS "zstd@testing.null,"
 #else
 #define ZSTDS ""
 #endif
